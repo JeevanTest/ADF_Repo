@@ -1,0 +1,204 @@
+trigger: 
+ branches:
+   include:
+     - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+ workingDirectory: '$(Build.Repository.LocalPath)'
+ publishDirectory: '$(workingDirectory)/adf_publish'
+ artifactName: 'adf-arm-artifact'
+ devResourceGroup: 'zen-dev-grp'
+ devDataFactory: 'zen-dev-adf'
+#  Dev Connection URL's
+ devInputADLSConnectionURL: 'https://zendevadls.dfs.core.windows.net/'
+ devOutputADLSConnectionURL: 'https://zendevadls.dfs.core.windows.net/'
+ devKeyVaultBaseURL: 'https://zen-dev-akv.vault.azure.net/'
+#  stageResourceGroup: 'zen-stg-grp'
+#  stageDataFactory: 'zen-stg-adf'
+
+stages:
+- stage: build
+  displayName: 'Build Artifacts'
+
+  jobs:
+  - job: Build_ADF_ARM_Template
+    displayName: 'Build ADF ARM Templates'
+    workspace:
+      clean: all
+
+    steps:
+
+    - checkout: self
+      displayName: 'Checkout ADF Repo'
+      clean: true
+
+    - task: UseNode@1
+      inputs:
+        version: '18.x'
+        checkLatest: true
+      displayName: 'Install Node.js'
+
+    - task: Npm@1
+      inputs:
+        command: 'install'
+        workingDir: '$(workingDirectory)/Package'
+        verbose: true
+      displayName: 'Install npm package'
+      
+    - task: Npm@1
+      inputs:
+        command: 'custom'
+        workingDir: '$(workingDirectory)/Package'
+        customCommand: 'run build validate $(workingDirectory) /subscriptions/25987c99-1fea-4a3c-bf3a-f22e90c8c662/resourceGroups/$(devResourceGroup)/providers/Microsoft.DataFactory/factories/$(devDataFactory)'
+      displayName: 'Validate the Source Code'
+
+    - task: Npm@1
+      inputs:
+        command: 'custom'
+        workingDir: '$(workingDirectory)/Package'
+        customCommand: 'run build export $(workingDirectory) /subscriptions/25987c99-1fea-4a3c-bf3a-f22e90c8c662/resourceGroups/$(devResourceGroup)/providers/Microsoft.DataFactory/factories/$(devDataFactory) "ArmTemplate"'
+      displayName: 'Validate and Generate ARM template'
+
+    
+    - script: ls -la /home/vsts/work/1/s/Package/ArmTemplate
+      displayName: 'List the files in ArmTemplate Directory'
+    
+    - script: cat /home/vsts/work/1/s/Package/ArmTemplate/ARMTemplateForFactory.json
+      displayName: 'Display the ARM Template contents'
+      
+    - script: cat /home/vsts/work/1/s/Package/ArmTemplate/ARMTemplateParametersForFactory.json
+      displayName: 'Display the Parameter Template contents' 
+    
+     
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(workingDirectory)/Package/ArmTemplate'
+        artifact: '$(artifactName)'
+        publishLocation: 'pipeline'
+      displayName: 'Publish Updated ARM Templates as Artifact'
+ 
+
+- stage: Development
+  displayName: 'Deploy to Development Environment'
+  dependsOn: build
+  condition: succeeded()
+  
+  variables:
+    - group: Dev-Var-Grp
+    - group: SP-Cred 
+
+  jobs:
+    - job: Deploy_to_Dev
+      displayName: 'Deploy to Development'
+      steps:
+        - task: DownloadPipelineArtifact@2
+          inputs:
+            artifact: '$(artifactName)'
+            targetPath: '$(workingDirectory)/Package/ArmTemplate'
+
+        - script: ls -la /home/vsts/work/1/s/Package/ArmTemplate
+          displayName: 'List the files in ArmTemplate Directory'
+
+        - task: AzureCLI@2
+          displayName: 'Azure Login with Service Principal'
+          inputs:
+            scriptType: 'bash'
+            scriptLocation: 'inlineScript'
+            useGlobalConfig: true
+            inlineScript: |
+              az login --service-principal \
+                -u $AZURE_CLIENT_ID \
+                -p $AZURE_CLIENT_SECRET \
+                --tenant $AZURE_TENANT_ID
+              az account set --subscription $AZURE_SUBSCRIPTION_ID
+          env:
+            AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
+            AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+            AZURE_TENANT_ID: $(AZURE_TENANT_ID)
+            AZURE_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID)
+
+        - task: AzureCLI@2
+          displayName: 'Deploy ARM Template to DEV'
+          inputs:
+            scriptType: 'bash'
+            scriptLocation: 'inlineScript'
+            useGlobalConfig: true
+            inlineScript: |
+              az deployment group create \
+                --resource-group $(devResourceGroup) \
+                --template-file $(workingDirectory)/Package/ArmTemplate/ARMTemplateForFactory.json \
+                --parameters @$(workingDirectory)/Package/ArmTemplate/ARMTemplateParametersForFactory.json \
+                --parameters factoryName=$(devDataFactory) \
+                --parameters ls_inputConnection_properties_typeProperties_url=$(devInputADLSConnectionURL) \
+                --parameters ls_kv_properties_typeProperties_baseUrl=$(devKeyVaultBaseURL) \
+                --parameters ls_outputConnection_properties_typeProperties_url=$(devOutputADLSConnectionURL) \
+                --mode Incremental
+          env:
+            AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
+            AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+            AZURE_TENANT_ID: $(AZURE_TENANT_ID)
+            AZURE_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID)
+
+- stage: Staging
+  displayName: 'Deploy to Stage Environment'
+  dependsOn: Development
+  condition: succeeded()
+  
+  variables:
+    - group: Stage-Var-Grp
+    - group: SP-Cred 
+
+  jobs:
+    - job: Deploy_to_Stage
+      displayName: 'Deploy to Stage'
+      steps:
+        - task: DownloadPipelineArtifact@2
+          inputs:
+            artifact: '$(artifactName)'
+            targetPath: '$(workingDirectory)/Package/ArmTemplate'
+
+        - script: ls -la /home/vsts/work/1/s/Package/ArmTemplate
+          displayName: 'List the files in ArmTemplate Directory'
+
+        - task: AzureCLI@2
+          displayName: 'Azure Login with Service Principal'
+          inputs:
+            scriptType: 'bash'
+            scriptLocation: 'inlineScript'
+            useGlobalConfig: true
+            inlineScript: |
+              az login --service-principal \
+                -u $AZURE_CLIENT_ID \
+                -p $AZURE_CLIENT_SECRET \
+                --tenant $AZURE_TENANT_ID
+              az account set --subscription $AZURE_SUBSCRIPTION_ID
+          env:
+            AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
+            AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+            AZURE_TENANT_ID: $(AZURE_TENANT_ID)
+            AZURE_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID)
+
+        - task: AzureCLI@2
+          displayName: 'Deploy ARM Template to STG'
+          inputs:
+            scriptType: 'bash'
+            scriptLocation: 'inlineScript'
+            useGlobalConfig: true
+            inlineScript: |
+              az deployment group create \
+                --resource-group $(stageResourceGroup) \
+                --template-file $(workingDirectory)/Package/ArmTemplate/ARMTemplateForFactory.json \
+                --parameters @$(workingDirectory)/Package/ArmTemplate/ARMTemplateParametersForFactory.json \
+                --parameters factoryName=$(stageDataFactory) \
+                --parameters ls_inputConnection_properties_typeProperties_url=$(stageInputADLSConnectionURL) \
+                --parameters ls_kv_properties_typeProperties_baseUrl=$(stageKeyVaultBaseURL) \
+                --parameters ls_outputConnection_properties_typeProperties_url=$(stageOutputADLSConnectionURL) \
+                --mode Incremental
+          env:
+            AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
+            AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+            AZURE_TENANT_ID: $(AZURE_TENANT_ID)
+            AZURE_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID)
