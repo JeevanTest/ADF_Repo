@@ -1,0 +1,212 @@
+trigger: none
+#  branches:
+#    include:
+#      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+
+variables:
+  - group: Build-Var-Grp
+  - group: Dev-Var-Grp
+
+
+stages:
+- stage: build
+  displayName: 'Build Artifacts'
+
+  jobs:
+  - job: Build_ADF_ARM_Template
+    displayName: 'Build ADF ARM Templates'
+    workspace:
+      clean: all
+
+    steps:
+
+    - checkout: self
+      displayName: 'Checkout ADF Repo'
+      clean: true
+
+    - task: UseNode@1
+      inputs:
+        version: '18.x'
+        checkLatest: true
+      displayName: 'Install Node.js'
+
+    - task: Npm@1
+      inputs:
+        command: 'install'
+        workingDir: '$(workingDirectory)/Package'
+        verbose: true
+      displayName: 'Install npm package'
+      
+    - task: Npm@1
+      inputs:
+        command: 'custom'
+        workingDir: '$(workingDirectory)/Package'
+        customCommand: 'run build validate $(workingDirectory) /subscriptions/$(subscriptionId)/resourceGroups/$(devResourceGroup)/providers/Microsoft.DataFactory/factories/$(devDataFactory)'
+      displayName: 'Validate the Source Code'
+
+    # - script: echo '{}' > $(workingDirectory)/arm-template-parameters-definition.json
+    #   displayName: 'Create placeholder for arm-template-parameters-definition.json'
+
+    - task: Npm@1
+      inputs:
+        command: 'custom'
+        workingDir: '$(workingDirectory)/Package'
+        customCommand: 'run build export $(workingDirectory) /subscriptions/$(subscriptionId)/resourceGroups/$(devResourceGroup)/providers/Microsoft.DataFactory/factories/$(devDataFactory) "ArmTemplate"'
+      displayName: 'Validate and Generate ARM template'
+
+
+    - script: ls -la $(workingDirectory)/Package/ArmTemplate
+      displayName: 'List the files in ArmTemplate Directory'
+    
+    - script: cat $(workingDirectory)/Package/ArmTemplate/ARMTemplateForFactory.json
+      displayName: 'Display the ARM Template contents'
+      
+    - script: cat $(workingDirectory)/Package/ArmTemplate/ARMTemplateParametersForFactory.json
+      displayName: 'Display the Parameter Template contents' 
+      
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(workingDirectory)/Package/ArmTemplate'
+        artifact: '$(artifactName)'
+        publishLocation: 'pipeline'
+      displayName: 'Publish Updated ARM Templates as Artifact'
+ 
+
+
+- stage: Development
+  displayName: 'Deploy to Development Environment'
+  dependsOn: build
+  condition: succeeded()
+  
+  variables:
+    - group: Dev-Var-Grp
+
+  jobs:
+  - deployment: Deploy_to_Dev
+    displayName: 'Deploy to Development'
+    environment:
+      name: DEV
+    strategy:
+      runOnce:
+       deploy:
+         steps:
+           - task: DownloadPipelineArtifact@2
+             inputs:
+              artifact: '$(artifactName)'
+              targetPath: '$(workingDirectory)/Package/ArmTemplate'
+            
+                                    
+           - task: AzureResourceManagerTemplateDeployment@3
+             displayName: 'Deploy ARM Templates to DEV'
+             inputs:
+               deploymentScope: 'Resource Group'
+               azureResourceManagerConnection: '$(serviceConnection)'
+               subscriptionId: $(subscriptionId)
+               action: 'Create Or Update Resource Group'
+               resourceGroupName: '$(devResourceGroup)'
+               location: '$(devResourceLocation)'
+               templateLocation: 'Linked artifact'
+               csmFile: '$(workingDirectory)/Package/ArmTemplate/ARMTemplateForFactory.json'
+               csmParametersFile: '$(workingDirectory)/Package/ArmTemplate/ARMTemplateParametersForFactory.json'
+               overrideParameters: >
+                 -factoryName $(devDataFactory)
+                 -ls_inputConnection_properties_typeProperties_url $(devInputADLSConnectionURL)
+                 -ls_kv_properties_typeProperties_baseUrl $(devKeyVaultBaseURL)
+                 -ls_outputConnection_properties_typeProperties_url $(devOutputADLSConnectionURL)
+                #  -adlspvtep_properties_privateLinkResourceId /subscriptions/$(subscriptionId)/resourceGroups/$(devResourceGroup)/providers/Microsoft.Storage/storageAccounts/$(devDataLakeName)
+                #  -akvpvtep_properties_privateLinkResourceId /subscriptions/$(subscriptionId)/resourceGroups/$(devResourceGroup)/providers/Microsoft.KeyVault/vaults/$(devKeyVaultName)
+               deploymentMode: 'Incremental'
+
+
+
+- stage: Staging
+  displayName: 'Deploy to Stage Environment'
+  dependsOn: Development
+  condition: succeeded()
+  
+  variables:
+    - group: Stg-Var-Grp
+
+  jobs:
+  - deployment: Deploy_to_Stage
+    displayName: 'Deploy to Stage'
+    environment:
+      name: STG
+    strategy:
+      runOnce:
+       deploy:
+         steps:
+           - task: DownloadPipelineArtifact@2
+             inputs:
+              artifact: '$(artifactName)'
+              targetPath: '$(workingDirectory)/Package/ArmTemplate'
+                                              
+           - task: AzureResourceManagerTemplateDeployment@3
+             displayName: 'Deploy ARM Templates to Stage'
+             inputs:
+               deploymentScope: 'Resource Group'
+               azureResourceManagerConnection: '$(serviceConnection)'
+               subscriptionId: $(subscriptionId)
+               action: 'Create Or Update Resource Group'
+               resourceGroupName: '$(stgResourceGroup)'
+               location: '$(stgResourceLocation)'
+               templateLocation: 'Linked artifact'
+               csmFile: '$(workingDirectory)/Package/ArmTemplate/ARMTemplateForFactory.json'
+               csmParametersFile: '$(workingDirectory)/Package/ArmTemplate/ARMTemplateParametersForFactory.json'
+               overrideParameters: >
+                 -factoryName $(stgDataFactory)
+                 -ls_inputConnection_properties_typeProperties_url $(stgInputADLSConnectionURL)
+                 -ls_kv_properties_typeProperties_baseUrl $(stgKeyVaultBaseURL)
+                 -ls_outputConnection_properties_typeProperties_url $(stgOutputADLSConnectionURL)
+                #  -adlspvtep_properties_privateLinkResourceId /subscriptions/$(subscriptionId)/resourceGroups/$(stgeResourceGroup)/providers/Microsoft.Storage/storageAccounts/$(stgDataLake)
+                #  -akvpvtep_properties_privateLinkResourceId /subscriptions/$(subscriptionId)/resourceGroups/$(stgResourceGroup)/providers/Microsoft.KeyVault/vaults/$(stgKeyVault)
+               deploymentMode: 'Incremental'
+
+
+
+# - stage: Production
+#   displayName: 'Deploy to Prod Environment'
+#   dependsOn: Staging
+#   condition: succeeded()
+  
+#   variables:
+#     - group: Prd-Var-Grp
+
+#   jobs:
+#   - deployment: Deploy_to_Prod
+#     displayName: 'Deploy to Prod'
+#     environment:
+#       name: PRD
+#     strategy:
+#       runOnce:
+#        deploy:
+#          steps:
+#            - task: DownloadPipelineArtifact@2
+#              inputs:
+#               artifact: '$(artifactName)'
+#               targetPath: '$(workingDirectory)/Package/ArmTemplate'
+                                            
+#            - task: AzureResourceManagerTemplateDeployment@3
+#              displayName: 'Deploy ARM Templates to Prod'
+#              inputs:
+#                deploymentScope: 'Resource Group'
+#                azureResourceManagerConnection: '$(serviceConnection)'
+#                subscriptionId: '$(subscriptionId)'
+#                action: 'Create Or Update Resource Group'
+#                resourceGroupName: '$(prodResourceGroup)'
+#                location: '$(prdResourceLocation)'
+#                templateLocation: 'Linked artifact'
+#                csmFile: '$(workingDirectory)/Package/ArmTemplate/ARMTemplateForFactory.json'
+#                csmParametersFile: '$(workingDirectory)/Package/ArmTemplate/ARMTemplateParametersForFactory.json'
+#                overrideParameters: >
+#                  -factoryName $(prodDataFactory)
+#                  -ls_inputConnection_properties_typeProperties_url $(prodInputADLSConnectionURL)
+#                  -ls_kv_properties_typeProperties_baseUrl $(prodKeyVaultBaseURL)
+#                  -ls_outputConnection_properties_typeProperties_url $(prodOutputADLSConnectionURL)
+#                  -adlspvtep_properties_privateLinkResourceId /subscriptions/$(subscriptionId)/resourceGroups/$(prdResourceGroup)/providers/Microsoft.Storage/storageAccounts/$(prdDataLake)
+#                  -akvpvtep_properties_privateLinkResourceId /subscriptions/$(subscriptionId)/resourceGroups/$(prdResourceGroup)/providers/Microsoft.KeyVault/vaults/$(prdKeyVault)
+#                deploymentMode: 'Incremental'
