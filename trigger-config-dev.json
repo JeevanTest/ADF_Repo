@@ -1,0 +1,62 @@
+{
+  "tg_delete_OnPremFiles": {
+    "runtimeState": "Started",
+    "recurrence": {
+      "frequency": "Day",
+      "interval": 1,
+      "startTime": "2025-11-04T13:00:00",
+      "timeZone": "Eastern Standard Time"
+    },
+    "pipelines": [
+      {
+        "referenceName": "Delete_Files_from_OnPrem_Server",
+        "parameters": {}
+      }
+    ]
+  },
+  "tg_files_onprem": {
+    "runtimeState": "Started",
+    "recurrence": {
+      "frequency": "Day",
+      "interval": 1,
+      "startTime": "2025-11-04T06:30:00",
+      "timeZone": "Eastern Standard Time"
+    },
+    "pipelines": [
+      {
+        "referenceName": "Copy_Files_OnPrem_to_ADLS_Parent",
+        "parameters": {}
+      }
+    ]
+  },
+  "tg_sqlserver_query": {
+    "runtimeState": "Stopped",
+    "recurrence": {
+      "frequency": "Day",
+      "interval": 1,
+      "startTime": "2025-11-04T09:00:00",
+      "timeZone": "Eastern Standard Time"
+    },
+    "pipelines": [
+      {
+        "referenceName": "Copy_SQLServer_QueryOutput_to_ADLS",
+        "parameters": {}
+      }
+    ]
+  },
+  "tg_sqlserver_tablecopy": {
+    "runtimeState": "Started",
+    "recurrence": {
+      "frequency": "Day",
+      "interval": 1,
+      "startTime": "2025-11-07T10:00:00",
+      "timeZone": "Eastern Standard Time"
+    },
+    "pipelines": [
+      {
+        "referenceName": "Copy_SQLServer_Tables_to_ADLS",
+        "parameters": {}
+      }
+    ]
+  }
+}
