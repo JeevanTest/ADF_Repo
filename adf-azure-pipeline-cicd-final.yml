@@ -1,0 +1,394 @@
+trigger:
+ branches:
+   include:
+     - main
+
+pool:
+  vmImage: ubuntu-latest
+
+
+variables:
+  - group: Build-Var-Grp
+  - group: Dev-Var-Grp
+
+
+stages:
+- stage: build
+  displayName: 'Build Artifacts'
+
+  jobs:
+  - job: Build_ADF_ARM_Template
+    displayName: 'Build ADF ARM Templates'
+    workspace:
+      clean: all
+
+    steps:
+
+    - checkout: self
+      displayName: 'Checkout ADF Repo'
+      clean: true
+
+    - task: UseNode@1
+      inputs:
+        version: '18.x'
+        checkLatest: true
+      displayName: 'Install Node.js'
+
+    - task: Npm@1
+      inputs:
+        command: 'install'
+        workingDir: '$(workingDirectory)/Package'
+        verbose: true
+      displayName: 'Install npm package'
+      
+    - task: Npm@1
+      inputs:
+        command: 'custom'
+        workingDir: '$(workingDirectory)/Package'
+        customCommand: 'run build validate $(workingDirectory) /subscriptions/$(devSubscriptionId)/resourceGroups/$(devResourceGroup)/providers/Microsoft.DataFactory/factories/$(devDataFactory)'
+      displayName: 'Validate the Source Code'
+
+    # - script: echo '{}' > $(workingDirectory)/arm-template-parameters-definition.json
+    #   displayName: 'Create placeholder for arm-template-parameters-definition.json'
+
+    - task: Npm@1
+      inputs:
+        command: 'custom'
+        workingDir: '$(workingDirectory)/Package'
+        customCommand: 'run build export $(workingDirectory) /subscriptions/$(devSubscriptionId)/resourceGroups/$(devResourceGroup)/providers/Microsoft.DataFactory/factories/$(devDataFactory) "ArmTemplate"'
+      displayName: 'Validate and Generate ARM template'
+
+    - script: ls -la $(workingDirectory)/Package/ArmTemplate
+      displayName: 'List the files in ArmTemplate Directory'
+
+    - script: cat $(workingDirectory)/Package/ArmTemplate/ARMTemplateForFactory.json
+      displayName: 'Display the ARM Template contents'
+
+    - script: cat $(workingDirectory)/Package/ArmTemplate/ARMTemplateParametersForFactory.json
+      displayName: 'Display the Parameter Template contents' 
+
+    - script: |
+        mkdir -p $(workingDirectory)/Package/ArmTemplate/Scripts
+        mkdir -p $(workingDirectory)/Package/ArmTemplate/Configs
+        cp -r $(workingDirectory)/Scripts/* $(workingDirectory)/Package/ArmTemplate/Scripts/
+        cp -r $(workingDirectory)/Configs/* $(workingDirectory)/Package/ArmTemplate/Configs/
+      displayName: 'Copying the Scripts & Config folders into artifact'
+
+    - script: ls -la $(workingDirectory)/Package/ArmTemplate
+      displayName: 'Verify Scripts and Configs folders copied to ArmTemplate'
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(workingDirectory)/Package/ArmTemplate'
+        artifact: '$(artifactName)'
+        publishLocation: 'pipeline'
+      displayName: 'Publish Updated ARM Templates as Artifact'
+
+
+
+- stage: Development
+  displayName: 'Deploy to Development Environment'
+  dependsOn: build
+  condition: succeeded()
+
+  variables:
+    - group: Dev-Var-Grp
+
+  jobs:
+  - deployment: Deploy_to_Dev
+    displayName: 'Deploy to Development'
+    environment:
+      name: DEV
+    strategy:
+      runOnce:
+       deploy:
+         steps:
+            # task to disable triggers in Azure Data Factory.
+           - task: AzurePowerShell@5     
+             displayName: Stop Triggers
+             inputs:
+              azureSubscription: '$(devServiceConnection)'
+              ScriptType: 'InlineScript'
+              Inline: |
+                $triggersADF = Get-AzDataFactoryV2Trigger -DataFactoryName "$(devDataFactory)" -ResourceGroupName "$(devResourceGroup)"; 
+                $triggersADF | ForEach-Object { Stop-AzDataFactoryV2Trigger -ResourceGroupName "$(devResourceGroup)" -DataFactoryName "$(devDataFactory)" -Name $_.name -Force }
+              azurePowerShellVersion: 'LatestVersion'
+
+           - task: DownloadPipelineArtifact@2
+             inputs:
+              artifact: '$(artifactName)'
+              targetPath: '$(workingDirectory)/Package/devArmTemplate'
+
+           - task: AzureResourceManagerTemplateDeployment@3
+             displayName: 'Deploy ARM Templates to DEV'
+             inputs:
+               deploymentScope: 'Resource Group'
+               azureResourceManagerConnection: '$(devServiceConnection)'
+               subscriptionId: $(devSubscriptionId)
+               action: 'Create Or Update Resource Group'
+               resourceGroupName: '$(devResourceGroup)'
+               location: '$(devResourceLocation)'
+               templateLocation: 'Linked artifact'
+               csmFile: '$(workingDirectory)/Package/devArmTemplate/ARMTemplateForFactory.json'
+               csmParametersFile: '$(workingDirectory)/Package/devArmTemplate/ARMTemplateParametersForFactory.json'
+               overrideParameters: >
+                 -factoryName $(devDataFactory)
+                 -ls_adls_data_eus_001_properties_typeProperties_url $(devOutputADLSConnectionURL)
+                 -ls_kv_properties_typeProperties_baseUrl $(devKeyVaultBaseURL)
+                 -ls_plt_deg_1_properties_typeProperties_host $(devInputShirDegURL)
+                 -pvtepadlsitdataeus001_properties_privateLinkResourceId $(devPvtepAdls)
+                 -pvtepkvitdataeus001_properties_privateLinkResourceId $(devPvtepKv)
+                 -pvtepblobitdataeus001_properties_privateLinkResourceId $(devPvtepBlob)
+                 -ls_blob_data_eus_001_properties_typeProperties_serviceEndpoint $(devOutputBlobConnectionURL)
+                 -ls_blob_data_eus_001_sas_uri_sasUri $(devBlobSASURI)
+                 -ls_snowflake_properties_typeProperties_database $(devSnowflakeDatabase)
+                 -ls_snowflake_properties_typeProperties_role $(devSnowflakeRole)
+               deploymentMode: 'Incremental'
+
+            # task to enable triggers in Azure Data Factory.
+           - task: AzurePowerShell@5     
+             displayName: Start Triggers
+             inputs:
+              azureSubscription: '$(devServiceConnection)'
+              ScriptType: 'InlineScript'
+              Inline: |
+                $triggersADF = Get-AzDataFactoryV2Trigger -DataFactoryName "$(devDataFactory)" -ResourceGroupName "$(devResourceGroup)"; 
+                $triggersADF | ForEach-Object { Start-AzDataFactoryV2Trigger -ResourceGroupName "$(devResourceGroup)" -DataFactoryName "$(devDataFactory)" -Name $_.name -Force }
+              azurePowerShellVersion: 'LatestVersion'
+
+            # task to stop/start specific triggers and modify the schedule time in Azure Data Factory.
+           - task: AzurePowerShell@5
+             displayName: 'Update ADF Trigger States'
+             inputs:
+              azureSubscription: '$(devServiceConnection)'
+              ScriptType: 'FilePath'
+              ScriptPath: '$(workingDirectory)/Package/devArmTemplate/Scripts/Update-AdfTriggers.ps1'
+              ScriptArguments: >
+                -resourceGroup "$(devResourceGroup)"
+                -dataFactoryName "$(devDataFactory)"
+                -triggerConfigPath "$(workingDirectory)/Package/devArmTemplate/Configs/trigger-config-dev.json"
+              azurePowerShellVersion: 'LatestVersion'
+              pwsh: true
+
+
+- stage: Staging
+  displayName: 'Deploy to Stage Environment'
+  dependsOn: Development
+  condition: succeeded()
+  
+  variables:
+    - group: Stg-Var-Grp
+
+  jobs:
+  - deployment: Deploy_to_Stage
+    displayName: 'Deploy to Stage'
+    environment:
+      name: STG
+    strategy:
+      runOnce:
+       deploy:
+         steps:
+
+           - task: AzurePowerShell@5
+             displayName: Stop Triggers
+             inputs:
+              azureSubscription: 'ADO_ADF_Stg'
+              ScriptType: 'InlineScript'
+              Inline: |
+                $triggersADF = Get-AzDataFactoryV2Trigger -DataFactoryName "$(stgDataFactory)" -ResourceGroupName "$(stgResourceGroup)"; 
+                $triggersADF | ForEach-Object { Stop-AzDataFactoryV2Trigger -ResourceGroupName "$(stgResourceGroup)" -DataFactoryName "$(stgDataFactory)" -Name $_.name -Force }
+              azurePowerShellVersion: 'LatestVersion'
+
+           - task: DownloadPipelineArtifact@2
+             inputs:
+              artifact: '$(artifactName)'
+              targetPath: '$(workingDirectory)/Package/stgArmTemplate'
+
+           - powershell: |
+               $armTemplatePath = "$(workingDirectory)/Package/stgArmTemplate/ARMTemplateForFactory.json"
+               $template = Get-Content $armTemplatePath -Raw | ConvertFrom-Json
+               foreach ($res in $template.resources) {
+                   if (
+                       ($res.type -eq "Microsoft.DataFactory/factories/integrationRuntimes") -and
+                       (
+                           ($res.name -eq "OnpremSHIR") -or
+                           ($res.name -eq "[concat(parameters('factoryName'), '/OnpremSHIR')]")
+                       )
+                   ) {
+                       $res.properties.typeProperties = @{
+                           linkedInfo = @{
+                               resourceId = "/subscriptions/$(devSubscriptionId)/resourcegroups/$(devResourceGroup)/providers/Microsoft.DataFactory/factories/$(devDataFactory)/integrationruntimes/OnpremSHIR"
+                               authorizationType = "Rbac"
+                           }
+                       }
+                   }
+               }
+               $template | ConvertTo-Json -Depth 100 | Set-Content $armTemplatePath
+             displayName: 'Update OnPremSHIR typeProperties for Stage'
+
+           - powershell: |
+               $armTemplatePath = "$(workingDirectory)/Package/stgArmTemplate/ARMTemplateForFactory.json"
+               $template = Get-Content $armTemplatePath -Raw | ConvertFrom-Json
+               foreach ($res in $template.resources) {
+                   if (
+                       ($res.type -eq "Microsoft.DataFactory/factories/linkedServices") -and
+                        (
+                           ($res.name -eq "ls_snowflake") -or
+                           ($res.name -eq "[concat(parameters('factoryName'), '/ls_snowflake')]")
+                       )
+                   ) {
+                       $res.properties.typeProperties.user = '$(stgSnowflakeUser)'
+                   }
+               }
+               $template | ConvertTo-Json -Depth 100 | Set-Content $armTemplatePath
+             displayName: 'Update Snowflake Linked Service User'
+
+           - script: cat $(workingDirectory)/Package/stgArmTemplate/ARMTemplateForFactory.json
+             displayName: 'Display the ARM Template contents'
+
+           - task: AzureResourceManagerTemplateDeployment@3
+             displayName: 'Deploy ARM Templates to Stage'
+             inputs:
+               deploymentScope: 'Resource Group'
+               azureResourceManagerConnection: 'ADO_ADF_Stg'
+               subscriptionId: $(stgSubscriptionId)
+               action: 'Create Or Update Resource Group'
+               resourceGroupName: '$(stgResourceGroup)'
+               location: '$(stgResourceLocation)'
+               templateLocation: 'Linked artifact'
+               csmFile: '$(workingDirectory)/Package/stgArmTemplate/ARMTemplateForFactory.json'
+               csmParametersFile: '$(workingDirectory)/Package/stgArmTemplate/ARMTemplateParametersForFactory.json'
+               overrideParameters: >
+                 -factoryName $(stgDataFactory)
+                 -ls_adls_data_eus_001_properties_typeProperties_url $(stgOutputADLSConnectionURL)
+                 -ls_kv_properties_typeProperties_baseUrl $(stgKeyVaultBaseURL)
+                 -ls_plt_deg_1_properties_typeProperties_host $(stgInputShirDegURL)
+                 -pvtepadlsitdataeus001_properties_privateLinkResourceId $(stgPvtepAdls)
+                 -pvtepkvitdataeus001_properties_privateLinkResourceId $(stgPvtepKv)
+                 -pvtepblobitdataeus001_properties_privateLinkResourceId $(stgPvtepBlob)
+                 -ls_blob_data_eus_001_properties_typeProperties_serviceEndpoint $(stgOutputBlobConnectionURL)
+                 -ls_blob_data_eus_001_sas_uri_sasUri $(stgBlobSASURI)
+                 -ls_snowflake_properties_typeProperties_database $(stgSnowflakeDatabase)
+                 -ls_snowflake_properties_typeProperties_role $(stgSnowflakeRole)
+               deploymentMode: 'Incremental'
+
+           - task: AzurePowerShell@5
+             displayName: Start Triggers
+             inputs:
+              azureSubscription: 'ADO_ADF_Stg'
+              ScriptType: 'InlineScript'
+              Inline: |
+                $triggersADF = Get-AzDataFactoryV2Trigger -DataFactoryName "$(stgDataFactory)" -ResourceGroupName "$(stgResourceGroup)"; 
+                $triggersADF | ForEach-Object { Start-AzDataFactoryV2Trigger -ResourceGroupName "$(stgResourceGroup)" -DataFactoryName "$(stgDataFactory)" -Name $_.name -Force }
+              azurePowerShellVersion: 'LatestVersion'
+
+           - task: AzurePowerShell@5
+             displayName: 'Update ADF Trigger States'
+             inputs:
+              azureSubscription: 'ADO_ADF_Stg'
+              ScriptType: 'FilePath'
+              ScriptPath: '$(workingDirectory)/Package/stgArmTemplate/Scripts/Update-AdfTriggers.ps1'
+              ScriptArguments: >
+                -resourceGroup "$(stgResourceGroup)"
+                -dataFactoryName "$(stgDataFactory)"
+                -triggerConfigPath "$(workingDirectory)/Package/stgArmTemplate/Configs/trigger-config-stg.json"
+              azurePowerShellVersion: 'LatestVersion'
+              pwsh: true
+
+
+- stage: Production
+  displayName: 'Deploy to Prod Environment'
+  dependsOn: Staging
+  condition: succeeded()
+  
+  variables:
+    - group: Prd-Var-Grp
+
+  jobs:
+  - deployment: Deploy_to_Prod
+    displayName: 'Deploy to Prod'
+    environment:
+      name: PRD
+    strategy:
+      runOnce:
+       deploy:
+         steps:
+           - task: AzurePowerShell@5
+             displayName: Stop Triggers
+             inputs:
+              azureSubscription: 'ADO_ADF_Prd'
+              ScriptType: 'InlineScript'
+              Inline: |
+                $triggersADF = Get-AzDataFactoryV2Trigger -DataFactoryName "$(prdDataFactory)" -ResourceGroupName "$(prdResourceGroup)"; 
+                $triggersADF | ForEach-Object { Stop-AzDataFactoryV2Trigger -ResourceGroupName "$(prdResourceGroup)" -DataFactoryName "$(prdDataFactory)" -Name $_.name -Force }
+              azurePowerShellVersion: 'LatestVersion'
+           - task: DownloadPipelineArtifact@2
+             inputs:
+              artifact: '$(artifactName)'
+              targetPath: '$(workingDirectory)/Package/prdArmTemplate'
+
+           - powershell: |
+               $armTemplatePath = "$(workingDirectory)/Package/prdArmTemplate/ARMTemplateForFactory.json"
+               $template = Get-Content $armTemplatePath -Raw | ConvertFrom-Json
+               foreach ($res in $template.resources) {
+                   if (
+                       ($res.type -eq "Microsoft.DataFactory/factories/linkedServices") -and
+                        (
+                           ($res.name -eq "ls_snowflake") -or
+                           ($res.name -eq "[concat(parameters('factoryName'), '/ls_snowflake')]")
+                       )
+                   ) {
+                       $res.properties.typeProperties.user = '$(prdSnowflakeUser)'
+                   }
+               }
+               $template | ConvertTo-Json -Depth 100 | Set-Content $armTemplatePath
+             displayName: 'Update Snowflake Linked Service User'
+
+           - task: AzureResourceManagerTemplateDeployment@3
+             displayName: 'Deploy ARM Templates to Prod'
+             inputs:
+               deploymentScope: 'Resource Group'
+               azureResourceManagerConnection: 'ADO_ADF_Prd'
+               subscriptionId: '$(prdSubscriptionId)'
+               action: 'Create Or Update Resource Group'
+               resourceGroupName: '$(prdResourceGroup)'
+               location: '$(prdResourceLocation)'
+               templateLocation: 'Linked artifact'
+               csmFile: '$(workingDirectory)/Package/prdArmTemplate/ARMTemplateForFactory.json'
+               csmParametersFile: '$(workingDirectory)/Package/prdArmTemplate/ARMTemplateParametersForFactory.json'
+               overrideParameters: >
+                 -factoryName $(prdDataFactory)
+                 -ls_adls_data_eus_001_properties_typeProperties_url $(prdOutputADLSConnectionURL)
+                 -ls_kv_properties_typeProperties_baseUrl $(prdKeyVaultBaseURL)
+                 -ls_plt_deg_1_properties_typeProperties_host $(prdInputShirDegURL)
+                 -pvtepadlsitdataeus001_properties_privateLinkResourceId $(prdPvtepAdls)
+                 -pvtepkvitdataeus001_properties_privateLinkResourceId $(prdPvtepKv)
+                 -pvtepblobitdataeus001_properties_privateLinkResourceId $(prdPvtepBlob)
+                 -ls_blob_data_eus_001_properties_typeProperties_serviceEndpoint $(prdOutputBlobConnectionURL)
+                 -ls_blob_data_eus_001_sas_uri_sasUri $(prodBlobSASURI)
+                 -ls_snowflake_properties_typeProperties_database $(prodSnowflakeDatabase)
+                 -ls_snowflake_properties_typeProperties_role $(prodSnowflakeRole)
+               deploymentMode: 'Incremental'
+
+           - task: AzurePowerShell@5     
+             displayName: Start Triggers
+             inputs:
+              azureSubscription: 'ADO_ADF_Prd'
+              ScriptType: 'InlineScript'
+              Inline: |
+                $triggersADF = Get-AzDataFactoryV2Trigger -DataFactoryName "$(prdDataFactory)" -ResourceGroupName "$(prdResourceGroup)"; 
+                $triggersADF | ForEach-Object { Start-AzDataFactoryV2Trigger -ResourceGroupName "$(prdResourceGroup)" -DataFactoryName "$(prdDataFactory)" -Name $_.name -Force }
+              azurePowerShellVersion: 'LatestVersion'
+
+           - task: AzurePowerShell@5
+             displayName: 'Update ADF Trigger States'
+             inputs:
+              azureSubscription: 'ADO_ADF_Prd'
+              ScriptType: 'FilePath'
+              ScriptPath: '$(workingDirectory)/Package/prdArmTemplate/Scripts/Update-AdfTriggers.ps1'
+              ScriptArguments: >
+                -resourceGroup "$(prdResourceGroup)"
+                -dataFactoryName "$(prdDataFactory)"
+                -triggerConfigPath "$(workingDirectory)/Package/prdArmTemplate/Configs/trigger-config-prod.json"
+              azurePowerShellVersion: 'LatestVersion'
+              pwsh: true
